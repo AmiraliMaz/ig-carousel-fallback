@@ -9,8 +9,6 @@ const API_SECRET = process.env.API_SECRET || '';
 const IG_SESSIONID = process.env.IG_SESSIONID || '';
 const IG_CSRFTOKEN = process.env.IG_CSRFTOKEN || '';
 const IG_DS_USER_ID = process.env.IG_DS_USER_ID || '';
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
-const TG_CHAT_ID = process.env.TG_CHAT_ID || '214454949';
 const DM_CHECK_MIN_MS = 10 * 60 * 1000;
 const DM_CHECK_MAX_MS = 15 * 60 * 1000;
 const processedMessageIds = new Set();
@@ -85,23 +83,20 @@ async function fetchViaSaveclip(url) {
     return items;
   } catch (err) { try { if (page) await page.close(); } catch (e) {} throw err; }
 }
-async function sendToTelegram(items, sourceUrl) {
-  if (!TG_BOT_TOKEN) return 0;
-  const slides = items.filter(it => it.label === 'Download Video' || it.label === 'Download Image');
-  let sent = 0;
-  for (let i = 0; i < slides.length; i++) {
-    const s = slides[i]; const isVideo = s.label === 'Download Video';
-    try {
-      const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/${isVideo ? 'sendVideo' : 'sendPhoto'}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: TG_CHAT_ID, [isVideo ? 'video' : 'photo']: s.url, caption: `Slide ${i+1} of ${slides.length}\n🔗 ${sourceUrl}`, parse_mode: 'HTML' })
-      });
-      const data = await resp.json();
-      if (data.ok) sent++;
-    } catch (e) {}
-    await new Promise(r => setTimeout(r, 2000));
+async function notifyN8n(url, msgId) {
+  const webhookUrl = 'https://n8n-production-1542.up.railway.app/webhook/microservice-url';
+  try {
+    const resp = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, msgId }),
+    });
+    console.log(`[dm] notified n8n for ${url}: HTTP ${resp.status}`);
+    return resp.ok;
+  } catch (e) {
+    console.log(`[dm] failed to notify n8n: ${e.message}`);
+    return false;
   }
-  return sent;
 }
 async function checkDMs() {
   if (!IG_SESSIONID) return;
@@ -125,10 +120,8 @@ async function checkDMs() {
     for (const share of shares) {
       if (processedMessageIds.has(share.msgId)) continue;
       processedMessageIds.add(share.msgId);
-      try {
-        const items = await fetchViaSaveclip(share.url);
-        if (items.length > 0) await sendToTelegram(items, share.url);
-      } catch (e) {}
+      console.log(`[dm] new share: ${share.url}`);
+      await notifyN8n(share.url, share.msgId);
     }
     await page.close(); page = null;
   } catch (err) { try { if (page) await page.close(); } catch (e) {} }
