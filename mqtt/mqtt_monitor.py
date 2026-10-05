@@ -107,7 +107,7 @@ async def ensure_session():
             cl.load_settings(str(SESSION_FILE))
             log.info("Loaded existing session from %s", SESSION_FILE)
             await cl.login(IG_USERNAME, IG_PASSWORD or "dummy")
-            log.info("Session valid,
+            log.info("Session valid,")
             return cl
         except Exception as e:
             log.warning("Stored session invalid: %s", e)
