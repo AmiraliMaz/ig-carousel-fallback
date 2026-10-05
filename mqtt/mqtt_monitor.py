@@ -88,6 +88,20 @@ async def ensure_session():
     """Ensure we have a valid mobile session. Returns aiograpi Client."""
     from aiograpi import Client
     cl = Client()
+
+    # Try IG_SESSIONID env (cookie-based, bypasses password login endpoint)
+    # This is unreliable for mobile API but worth trying when password login is rate-limited
+    sessionid = os.environ.get("IG_SESSIONID", "")
+    if sessionid:
+        try:
+            log.info("Trying login_by_sessionid...")
+            await cl.login_by_sessionid(sessionid)
+            cl.dump_settings(str(SESSION_FILE))
+            log.info("Sessionid login successful! Session saved.")
+            return cl
+        except Exception as e:
+            log.warning("login_by_sessionid failed: %s", e)
+
     if SESSION_FILE.exists():
         try:
             cl.load_settings(str(SESSION_FILE))
