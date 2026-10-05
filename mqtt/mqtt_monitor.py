@@ -107,16 +107,18 @@ async def ensure_session():
             cl.load_settings(str(SESSION_FILE))
             log.info("Loaded existing session from %s", SESSION_FILE)
             await cl.login(IG_USERNAME, IG_PASSWORD or "dummy")
-            log.info("Session valid, logged in as %s", IG_USERNAME)
+            log.info("Session valid,
             return cl
         except Exception as e:
             log.warning("Stored session invalid: %s", e)
+                # Try IG_SESSION_JSON env bootstrap
+               # NOTE: Do NOT call cl.login() here - the session is already valid.
+                   # Calling login hits the rate-limited endpoint and causes 429.
     session_json = os.environ.get("IG_SESSION_JSON", "")
     if session_json:
         try:
             settings = json.loads(session_json)
             cl.set_settings(settings)
-            await cl.login(IG_USERNAME, IG_PASSWORD or "dummy")
             cl.dump_settings(str(SESSION_FILE))
             log.info("Bootstrapped from IG_SESSION_JSON, saved to %s", SESSION_FILE)
             return cl
