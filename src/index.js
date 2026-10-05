@@ -115,7 +115,20 @@ app.post('/fetch', async (req, res) => {
   }
 
   try {
-    const items = await fetchViaSaveclip(url);
+    // Try logged-in session first (better for age-gated / restricted posts)
+    let items = [];
+    if (IG_SESSIONID) {
+      try {
+        items = await fetchViaSession(url);
+        console.log(`[fetch] session got ${items.length} items`);
+      } catch (e) {
+        console.log(`[fetch] session failed: ${e.message}, falling back to saveclip`);
+      }
+    }
+    // Fallback to saveclip
+    if (items.length === 0) {
+      items = await fetchViaSaveclip(url);
+    }
     if (items.length === 0) {
       return res.json({ status: 'error', message: 'no media found', items: [] });
     }
@@ -125,6 +138,57 @@ app.post('/fetch', async (req, res) => {
     return res.status(500).json({ status: 'error', message: err.message });
   }
 });
+
+/**
+ * Fetch media using logged-in Instagram session.
+ * Opens the post URL with session cookies and extracts video_url/display_url.
+ */
+async function fetchViaSession(url) {
+  let page = null;
+  try {
+    const b = await getBrowser();
+    page = await b.newPage();
+    await page.setUserAgent(randomUserAgent());
+    await page.setViewport(randomViewport());
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    await setIgCookies(page);
+
+    console.log('[session] opening', url);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+    await new Promise(r => setTimeout(r, 3000));
+
+    const items = await page.evaluate(() => {
+      const out = [];
+      const seen = new Set();
+      // Scan all script tags for video_url / display_url
+      const scripts = document.querySelectorAll('script[type="application/ld+json"], script');
+      const html = document.documentElement.innerHTML;
+      // video_url patterns
+      const videoRe = /"video_url"\s*:\s*"([^"]+)"/g;
+      let m;
+      while ((m = videoRe.exec(html)) !== null) {
+        let u = m[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+        if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'video', url: u }); }
+      }
+      // carousel display_url patterns
+      const imgRe = /"display_url"\s*:\s*"([^"]+)"/g;
+      while ((m = imgRe.exec(html)) !== null) {
+        let u = m[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+        if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'photo', url: u }); }
+      }
+      return out;
+    });
+
+    console.log(`[session] extracted ${items.length} items`);
+    await page.close(); page = null;
+    return items;
+  } catch (err) {
+    try { if (page) await page.close(); } catch (e) {}
+    throw err;
+  }
+}
 
 async function fetchViaSaveclip(url) {
   let page = null;
