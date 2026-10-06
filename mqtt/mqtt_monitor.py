@@ -178,9 +178,20 @@ async def mqtt_loop():
             await rt.direct_subscribe()
             await rt.ping()
             log.info("MQTT connected, listening for DMs (zero idle requests)")
+            # Reset backoff on successful connect
             backoff = int(os.environ.get("POLL_INTERVAL", "20"))
+
             while True:
-                await cl.realtime_read_once()
+                try:
+                    # Wait for message with 30s timeout; send ping on timeout to keep alive
+                    await asyncio.wait_for(cl.realtime_read_once(), timeout=30)
+                except asyncio.TimeoutError:
+                    try:
+                        await rt.ping()
+                        log.debug("Sent MQTT keepalive ping")
+                    except Exception as e:
+                        log.warning("Keepalive ping failed: %s", e)
+                        raise
         except KeyboardInterrupt:
             log.info("Shutting down")
             break
