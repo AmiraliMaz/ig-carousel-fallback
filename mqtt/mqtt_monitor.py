@@ -45,8 +45,19 @@ N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 SHARE_TYPES = {"media_share", "clip", "reel_share", "xma_media_share", "reel_share"}
 
 
-def find_share_codes(obj, out):
-    """Walk nested dicts/lists; any dict with share item_type yields a code."""
+def find_share_codes(obj, out, _depth=0):
+    """Walk nested dicts/lists; any dict with share item_type yields a code. Also parses JSON strings."""
+    if _depth > 20:
+        return
+    if isinstance(obj, str):
+        obj_stripped = obj.strip()
+        if obj_stripped.startswith("{") or obj_stripped.startswith("["):
+            try:
+                obj = json.loads(obj_stripped)
+            except Exception:
+                return
+        else:
+            return
     if isinstance(obj, dict):
         item_type = obj.get("item_type", "")
         if item_type in SHARE_TYPES:
@@ -62,10 +73,11 @@ def find_share_codes(obj, out):
             if code:
                 out.append((item_type, code))
         for v in obj.values():
-            find_share_codes(v, out)
+            find_share_codes(v, out, _depth + 1)
     elif isinstance(obj, list):
         for v in obj:
-            find_share_codes(v, out)
+            find_share_codes(v, out, _depth + 1)
+           
 
 
 def notify_n8n(item_type, code):
