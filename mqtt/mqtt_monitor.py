@@ -151,27 +151,6 @@ async def ensure_session():
     log.info("Login successful! Session saved to %s. You can now REMOVE IG_PASSWORD from env vars.", SESSION_FILE)
     return cl
 
-            def on_message(payload):
-                try:
-                    log.info("MQTT message received, keys: %s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
-                    # Deep inspect the message structure
-                    msg = payload.get("message") if isinstance(payload, dict) else None
-                    if isinstance(msg, dict):
-                        log.info("message keys: %s", list(msg.keys()))
-                        # Look for item_type at top level of message
-                        log.info("message item_type: %s", msg.get("item_type"))
-                    elif isinstance(msg, str):
-                        try:
-                            import json as _json
-                            msg_parsed = _json.loads(msg)
-                            log.info("message (parsed) keys: %s", list(msg_parsed.keys()) if isinstance(msg_parsed, dict) else type(msg_parsed).__name__)
-                            if isinstance(msg_parsed, dict):
-                                log.info("message (parsed) item_type: %s", msg_parsed.get("item_type"))
-                        except Exception as e:
-                            log.info("message is str, parse failed: %s, preview: %s", e, msg[:200])
-                    found = []
-                    find_share_codes(payload, found)
-                    log.info("Found %d share codes in payload", len(found))
 async def mqtt_loop():
     """Main MQTT loop with reconnect backoff."""
     from aiograpi import Client
