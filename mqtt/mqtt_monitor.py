@@ -163,8 +163,10 @@ async def mqtt_loop():
             seen_codes = set()
             def on_message(payload):
                 try:
+                    log.info("MQTT message received, keys: %s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
                     found = []
                     find_share_codes(payload, found)
+                    log.info("Found %d share codes in payload", len(found))
                     for item_type, code in found:
                         if code not in seen_codes:
                             seen_codes.add(code)
