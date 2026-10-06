@@ -3,11 +3,15 @@ Instagram DM MQTT Monitor (sidecar)
 Replaces Zernio as the DM trigger using moeinimy's aiograpi MQTT method.
 
 Flow:
-1. On first run: if IG_PASSWORD env is set and no session exists,
-   performs mobile login and saves session to SESSION_FILE.
-   (User removes IG_PASSWORD after this - it's never needed again.)
-2. Connects via MQTT (MQTToT), subscribes to DM events.
-3. On share detection: extracts shortcode, POSTs to n8n webhook.
+1. Preferred: IG_SESSION_JSON env holds a valid mobile session (minted via
+   a real mobile login). It is loaded directly with NO login-endpoint calls,
+   because Instagram rate-limits (429) logins from this server's IP and
+   repeated failed logins risk flagging the account. A single lightweight
+   API call warms/validates the session before the MQTT handshake.
+2. Fallback: IG_SESSIONID cookie, stored session file, or one-time
+   IG_PASSWORD login (then remove IG_PASSWORD).
+3. Connects via MQTT (MQTToT), subscribes to DM events.
+4. On share detection: extracts shortcode, POSTs to n8n webhook.
 
 Env vars:
 - IG_USERNAME: Instagram username (sacrificial account)
@@ -38,7 +42,7 @@ IG_USERNAME = os.environ.get("IG_USERNAME", "")
 IG_PASSWORD = os.environ.get("IG_PASSWORD", "")
 SESSION_FILE = Path(os.environ.get("SESSION_FILE", "/app/session.json"))
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
-SHARE_TYPES = {"media_share", "clip", "xma_media_share", "reel_share"}
+SHARE_TYPES = {"media_share", "clip", "reel_share", "xma_media_share", "reel_share"}
 
 
 def find_share_codes(obj, out):
@@ -89,6 +93,30 @@ async def ensure_session():
     from aiograpi import Client
     cl = Client()
 
+    # Try IG_SESSION_JSON env bootstrap FIRST.
+    # Deliberately makes NO login-endpoint calls: Instagram rate-limits (429)
+    # logins from this server's IP, and repeated failed logins risk flagging
+    # the account. The session in the JSON is already valid (minted via a
+    # real mobile login). A single lightweight API call warms/validates the
+    # session before the MQTT handshake (moeinimy's flow also signs in first).
+    # NOTE: Do NOT call cl.login() here - the session is already valid.
+    # Calling login hits the rate-limited endpoint and causes 429.
+    session_json = os.environ.get("IG_SESSION_JSON", "")
+    if session_json:
+        try:
+            settings = json.loads(session_json)
+            cl.set_settings(settings)
+            try:
+                await cl.get_timeline_feed()
+                log.info("Session validated via timeline feed")
+            except Exception as e:
+                log.warning("Session warm-up call failed (continuing anyway): %s", e)
+            cl.dump_settings(str(SESSION_FILE))
+            log.info("Bootstrapped from IG_SESSION_JSON, saved to %s", SESSION_FILE)
+            return cl
+        except Exception as e:
+            log.warning("IG_SESSION_JSON bootstrap failed: %s", e)
+
     # Try IG_SESSIONID env (cookie-based, bypasses password login endpoint)
     # This is unreliable for mobile API but worth trying when password login is rate-limited
     sessionid = os.environ.get("IG_SESSIONID", "")
@@ -102,28 +130,18 @@ async def ensure_session():
         except Exception as e:
             log.warning("login_by_sessionid failed: %s", e)
 
+    # Try loading existing session file (only reached when no IG_SESSION_JSON)
     if SESSION_FILE.exists():
         try:
             cl.load_settings(str(SESSION_FILE))
             log.info("Loaded existing session from %s", SESSION_FILE)
             await cl.login(IG_USERNAME, IG_PASSWORD or "dummy")
-            log.info("Session valid,")
+            log.info("Session valid, logged in as %s", IG_USERNAME)
             return cl
         except Exception as e:
             log.warning("Stored session invalid: %s", e)
-                # Try IG_SESSION_JSON env bootstrap
-               # NOTE: Do NOT call cl.login() here - the session is already valid.
-                   # Calling login hits the rate-limited endpoint and causes 429.
-    session_json = os.environ.get("IG_SESSION_JSON", "")
-    if session_json:
-        try:
-            settings = json.loads(session_json)
-            cl.set_settings(settings)
-            cl.dump_settings(str(SESSION_FILE))
-            log.info("Bootstrapped from IG_SESSION_JSON, saved to %s", SESSION_FILE)
-            return cl
-        except Exception as e:
-            log.warning("IG_SESSION_JSON bootstrap failed: %s", e)
+
+    # Fresh login with password (one-time)
     if not IG_USERNAME or not IG_PASSWORD:
         log.error("No valid session and IG_PASSWORD not set. Set IG_USERNAME and IG_PASSWORD env vars for one-time login, then remove IG_PASSWORD after session is minted.")
         sys.exit(1)
