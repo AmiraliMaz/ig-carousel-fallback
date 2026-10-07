@@ -409,8 +409,8 @@ function scheduleDMCheck() {
 
 app.listen(PORT, () => {
   console.log(`[fallback] listening on ${PORT}`);
-  // Start WebSocket real-time DM monitor (passive, no polling)
-  startWebSocketMonitor();
+  // WebSocket DM monitor DISABLED - n8n via Zernio is the primary DM→Telegram path
+  // startWebSocketMonitor();
   // Legacy polling monitor (disabled by default, enable if needed)
   // scheduleDMCheck();
 });
