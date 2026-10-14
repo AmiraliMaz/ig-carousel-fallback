@@ -139,7 +139,7 @@ app.get('/', (req, res) => res.json({
 /**
  * POST /fetch
  * Body: { url: "https://www.instagram.com/p/XXXX/", secret: "..." }
- * Returns: { status: "ok", items: [{ type: "photo"|"video", url: "https://..." }, ...] }
+ * Returns: { status: "ok", items: [{ type: "photo"|"video", url: "https://..." }, ...], source: "session"|"saveclip" }
  */
 app.post('/fetch', async (req, res) => {
   const { url, secret } = req.body || {};
@@ -153,9 +153,11 @@ app.post('/fetch', async (req, res) => {
   try {
     // Try logged-in session first (better for age-gated / restricted posts)
     let items = [];
+    let source = 'none';
     if (HAS_SESSION) {
       try {
         items = await fetchViaSession(url);
+        source = 'session';
         console.log(`[fetch] session got ${items.length} items`);
       } catch (e) {
         console.log(`[fetch] session failed: ${e.message}, falling back to saveclip`);
@@ -164,11 +166,12 @@ app.post('/fetch', async (req, res) => {
     // Fallback to saveclip
     if (items.length === 0) {
       items = await fetchViaSaveclip(url);
+      if (items.length > 0) source = 'saveclip';
     }
     if (items.length === 0) {
-      return res.json({ status: 'error', message: 'no media found', items: [] });
+      return res.json({ status: 'error', message: 'no media found', items: [], source });
     }
-    return res.json({ status: 'ok', items });
+    return res.json({ status: 'ok', items, source });
   } catch (err) {
     console.error('[fallback] error:', err.message);
     return res.status(500).json({ status: 'error', message: err.message });
@@ -177,100 +180,76 @@ app.post('/fetch', async (req, res) => {
 
 
 /**
- * Fetch media using logged-in Instagram session.
- * Uses direct HTTP (no browser) with the full mobile session bundle
- * (all cookies + mobile User-Agent) - 5-10x faster than Puppeteer.
+ * Fetch media using the logged-in Instagram session via the private
+ * media-info API (fast, no browser). Returns ordered items; carousels
+ * come back slide-by-slide with correct types.
  */
 async function fetchViaSession(url) {
-  const https = require('https');
-  return new Promise((resolve, reject) => {
-    const options = {
-      headers: {
-        'Cookie': sessionCookieHeader(),
-        'User-Agent': sessionUserAgent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      timeout: 15000,
-    };
-    console.log('[session] fetching (direct HTTP)', url);
-    https.get(url, options, (res) => {
-      let html = '';
-      res.on('data', chunk => html += chunk);
-      res.on('end', () => {
-        try {
-          // 1) carousel: ordered slides from edge_sidecar_to_children
-          let out = extractSidecarItems(html);
-          // 2) fallback: regex scan (single photo / video / reel)
-          if (!out || out.length === 0) out = extractMediaRegex(html);
-          console.log(`[session] extracted ${out.length} items (direct HTTP)`);
-          resolve(out);
-        } catch (e) { reject(e); }
-      });
-    }).on('error', reject).on('timeout', () => reject(new Error('HTTP timeout')));
+  const shortcode = extractShortcode(url);
+  if (!shortcode) throw new Error('no shortcode in url');
+  const mediaId = shortcodeToMediaId(shortcode);
+  const apiUrl = `https://i.instagram.com/api/v1/media/${mediaId}/info/`;
+  console.log('[session] api fetching', apiUrl);
+  const data = await httpsGetJson(apiUrl, {
+    'Cookie': sessionCookieHeader(),
+    'User-Agent': sessionUserAgent(),
+    'X-IG-App-ID': '567310203415052',
+    'Accept': 'application/json',
   });
-}
-
-/**
- * Ordered carousel slides from the page's edge_sidecar_to_children JSON.
- * Returns null when the post is not a carousel (caller falls back to regex).
- */
-function extractSidecarItems(html) {
-  const ki = html.indexOf('"edge_sidecar_to_children"');
-  if (ki === -1) return null;
-  const ei = html.indexOf('"edges"', ki);
-  if (ei === -1) return null;
-  const bi = html.indexOf('[', ei);
-  if (bi === -1) return null;
-  // bracket-match the edges array, respecting quoted strings
-  let depth = 0, inStr = false, esc = false, end = -1;
-  for (let i = bi; i < html.length; i++) {
-    const c = html[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (c === '\\') esc = true;
-      else if (c === '"') inStr = false;
-    } else {
-      if (c === '"') inStr = true;
-      else if (c === '[') depth++;
-      else if (c === ']') { depth--; if (depth === 0) { end = i; break; } }
-    }
-  }
-  if (end === -1) return null;
-  let edges;
-  try { edges = JSON.parse(html.slice(bi, end + 1)); } catch (e) { return null; }
+  const items = (data && data.items) || [];
+  if (!items.length) throw new Error('empty api response');
   const out = [];
   const seen = new Set();
-  for (const e of edges) {
-    const n = e && e.node;
-    if (!n) continue;
-    const isVideo = n.is_video === true || n.__typename === 'GraphVideo';
-    let u = (isVideo && n.video_url) || n.display_url || '';
-    u = String(u).replace(/\u0026/g, '&').replace(/\\/g, '');
-    if (u && u.includes('cdn') && !seen.has(u)) {
+  const pushMedia = (m) => {
+    const isVideo = m.media_type === 2;
+    const vv = m.video_versions || [];
+    const iv = (m.image_versions2 && m.image_versions2.candidates) || [];
+    const u = (isVideo && vv.length ? vv[0].url : null) || (iv.length ? iv[0].url : null) || '';
+    if (u && !seen.has(u)) {
       seen.add(u);
       out.push({ type: isVideo ? 'video' : 'photo', url: u });
     }
-  }
+  };
+  const first = items[0];
+  const carousel = first.carousel_media || [];
+  if (carousel.length) carousel.forEach(pushMedia);
+  else pushMedia(first);
+  console.log(`[session] extracted ${out.length} items (api)`);
+  if (!out.length) throw new Error('no media urls in api response');
   return out;
 }
 
-/** Regex scan for single-media posts (photo / video / reel). */
-function extractMediaRegex(html) {
-  const out = [];
-  const seen = new Set();
-  const videoRe = /"video_url"\s*:\s*"([^"]+)"/g;
-  let m;
-  while ((m = videoRe.exec(html)) !== null) {
-    let u = m[1].replace(/\u0026/g, '&').replace(/\\/g, '');
-    if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'video', url: u }); }
+function extractShortcode(url) {
+  const m = String(url || '').match(/instagram\.com\/(?:p|reel|tv)\/([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+function shortcodeToMediaId(shortcode) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let id = 0n;
+  for (const ch of shortcode) {
+    const i = alphabet.indexOf(ch);
+    if (i < 0) throw new Error('bad shortcode char');
+    id = id * 64n + BigInt(i);
   }
-  const imgRe = /"display_url"\s*:\s*"([^"]+)"/g;
-  while ((m = imgRe.exec(html)) !== null) {
-    let u = m[1].replace(/\u0026/g, '&').replace(/\\/g, '');
-    if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'photo', url: u }); }
-  }
-  return out;
+  return id.toString();
+}
+
+function httpsGetJson(url, headers) {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers, timeout: 15000 }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error('API HTTP ' + res.statusCode + ' ' + body.slice(0, 120)));
+        try { resolve(JSON.parse(body)); }
+        catch (e) { reject(new Error('bad json from api')); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('API timeout')); });
+  });
 }
 
 async function fetchViaSaveclip(url) {
@@ -363,48 +342,6 @@ async function fetchViaSaveclip(url) {
   }
 }
 
-async function sendToTelegram(items, sourceUrl) {
-  if (!TG_BOT_TOKEN) {
-    console.log('[dm] no TG_BOT_TOKEN, skipping send');
-    return 0;
-  }
-  // Filter to actual slides (skip thumbnails)
-  const slides = items.filter(it => it.label === 'Download Video' || it.label === 'Download Image');
-  console.log(`[dm] sending ${slides.length} slides to Telegram`);
-  let sent = 0;
-  for (let i = 0; i < slides.length; i++) {
-    const s = slides[i];
-    const isVideo = s.label === 'Download Video';
-    const caption = `Slide ${i + 1} of ${slides.length}\n🔗 ${sourceUrl}`;
-    try {
-      const endpoint = isVideo ? 'sendVideo' : 'sendPhoto';
-      const param = isVideo ? 'video' : 'photo';
-      const resp = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: TG_CHAT_ID,
-          [param]: s.url,
-          caption: caption,
-          parse_mode: 'HTML',
-        }),
-      });
-      const data = await resp.json();
-      if (data.ok) {
-        sent++;
-        console.log(`[dm] sent slide ${i + 1}/${slides.length}`);
-      } else {
-        console.log(`[dm] failed slide ${i + 1}: ${data.description}`);
-      }
-    } catch (e) {
-      console.log(`[dm] error sending slide ${i + 1}: ${e.message}`);
-    }
-    // Small delay between sends
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  return sent;
-}
-
 async function checkDMs() {
   if (!IG_SESSIONID) {
     console.log('[dm] no IG session configured, skipping');
@@ -469,7 +406,7 @@ async function checkDMs() {
       try {
         const items = await fetchViaSaveclip(share.url);
         if (items.length > 0) {
-          await sendToTelegram(items, share.url);
+          console.log(`[dm] got ${items.length} items (not sending: monitor disabled)`);
         }
       } catch (e) {
         console.log(`[dm] error processing ${share.url}: ${e.message}`);
@@ -483,142 +420,13 @@ async function checkDMs() {
   }
 }
 
-function scheduleDMCheck() {
-  if (!IG_SESSIONID) {
-    console.log('[dm] monitor disabled (no IG_SESSIONID)');
-    return;
-  }
-  const delay = DM_CHECK_MIN_MS + Math.random() * (DM_CHECK_MAX_MS - DM_CHECK_MIN_MS);
-  console.log(`[dm] next check in ${Math.round(delay / 60000)} min`);
-  setTimeout(async () => {
-    await checkDMs();
-    scheduleDMCheck();
-  }, delay);
-}
-
 app.listen(PORT, () => {
   console.log(`[fallback] listening on ${PORT}`);
   // WebSocket DM monitor DISABLED - n8n via Zernio is the primary DM→Telegram path
   // startWebSocketMonitor();
-  // Legacy polling monitor (disabled by default, enable if needed)
-  // scheduleDMCheck();
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
   try { if (browser) await browser.close(); } catch (e) {}
   process.exit(0);
 });
-
-// ===== WebSocket Real-time DM Monitor =====
-// Uses Chrome DevTools Protocol to passively observe Instagram's WebSocket
-// No extra API calls - just watches what the browser already receives
-
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || 'https://n8n-production-1542.up.railway.app/webhook/microservice-url';
-const wsProcessedIds = new Set();
-
-async function startWebSocketMonitor() {
-  if (!IG_SESSIONID) {
-    console.log('[ws] no IG session, WebSocket monitor disabled');
-    return;
-  }
-
-  console.log('[ws] starting WebSocket DM monitor...');
-  let page = null;
-
-  try {
-    const b = await getBrowser();
-    page = await b.newPage();
-    await page.setUserAgent(randomUserAgent());
-    await page.setViewport(randomViewport());
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-    await setIgCookies(page);
-
-    // Create CDP session for network monitoring
-    const cdp = await page.target().createCDPSession();
-    await cdp.send('Network.enable');
-
-    // Listen for WebSocket frames (Instagram real-time sync)
-    cdp.on('Network.webSocketFrameReceived', async (params) => {
-      try {
-        const payload = params.response?.payloadData || '';
-        if (!payload) return;
-
-        // Look for DM thread updates with shared posts
-        // Instagram WebSocket messages contain JSON with thread items
-        if (payload.includes('instagram.com/p/') || payload.includes('instagram.com/reel/')) {
-          const urls = payload.match(/https?:\/\/(www\.)?instagram\.com\/(p|reel)\/[A-Za-z0-9_-]+\/?/g);
-          if (urls) {
-            for (const url of urls) {
-              const cleanUrl = url.replace(/\/$/, '') + '/';
-              if (!wsProcessedIds.has(cleanUrl)) {
-                wsProcessedIds.add(cleanUrl);
-                if (wsProcessedIds.size > MAX_PROCESSED) {
-                  const first = wsProcessedIds.values().next().value;
-                  wsProcessedIds.delete(first);
-                }
-                console.log(`[ws] new share detected: ${cleanUrl}`);
-                await notifyN8n(cleanUrl);
-              }
-            }
-          }
-        }
-      } catch (e) {
-        // Ignore parse errors
-      }
-    });
-
-    // Also listen for GraphQL responses (thread sync)
-    cdp.on('Network.responseReceived', async (params) => {
-      try {
-        const url = params.response?.url || '';
-        // Instagram thread sync endpoints
-        if (url.includes('/direct/') || url.includes('graphql')) {
-          // The response body would need to be fetched via CDP
-          // For now, rely on WebSocket frames which are more reliable
-        }
-      } catch (e) {}
-    });
-
-    console.log('[ws] navigating to Instagram DMs...');
-    await page.goto('https://www.instagram.com/direct/inbox/', {
-      waitUntil: 'networkidle2',
-      timeout: 60000,
-    });
-
-    console.log('[ws] WebSocket monitor active - watching for new shares');
-    console.log('[ws] (browser tab stays open, passively observing)');
-
-    // Keep the page alive - monitor runs indefinitely
-    // Reconnect if page crashes
-    page.on('close', () => {
-      console.log('[ws] page closed, restarting monitor in 30s...');
-      setTimeout(startWebSocketMonitor, 30000);
-    });
-
-  } catch (err) {
-    console.error('[ws] monitor error:', err.message);
-    try { if (page) await page.close(); } catch (e) {}
-    // Retry in 60s
-    setTimeout(startWebSocketMonitor, 60000);
-  }
-}
-
-async function notifyN8n(shareUrl) {
-  try {
-    const resp = await fetch(N8N_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: shareUrl,
-        source: 'websocket-monitor',
-        timestamp: new Date().toISOString(),
-      }),
-    });
-    console.log(`[ws] notified n8n: ${resp.status}`);
-  } catch (e) {
-    console.log(`[ws] n8n notify failed: ${e.message}`);
-  }
-}
