@@ -10,10 +10,45 @@ const PORT = process.env.PORT || 3000;
 // Secret to prevent abuse — set via env on Railway
 const API_SECRET = process.env.API_SECRET || '';
 
-// Instagram session for DM monitoring (set via Railway env vars)
-const IG_SESSIONID = process.env.IG_SESSIONID || '';
-const IG_CSRFTOKEN = process.env.IG_CSRFTOKEN || '';
-const IG_DS_USER_ID = process.env.IG_DS_USER_ID || '';
+// Instagram session: full mobile bundle (instagrapi dump_settings) preferred.
+// Primary: SESSION_JSON env var (JSON string). Fallback: ./session.json file.
+// Legacy fallback: IG_SESSIONID / IG_DS_USER_ID / IG_CSRFTOKEN env vars.
+let SESSION = null;
+(function loadSessionBundle() {
+  try {
+    const raw = process.env.SESSION_JSON || '';
+    if (raw) {
+      SESSION = JSON.parse(raw);
+      console.log('[session] bundle loaded from SESSION_JSON env');
+      return;
+    }
+    const fs = require('fs');
+    const path = require('path');
+    const fp = path.join(__dirname, '..', 'session.json');
+    if (fs.existsSync(fp)) {
+      SESSION = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      console.log('[session] bundle loaded from session.json file');
+    }
+  } catch (e) {
+    console.log('[session] bundle load failed:', e.message);
+  }
+})();
+
+const IG_SESSIONID = (SESSION && SESSION.cookies && SESSION.cookies.sessionid) || process.env.IG_SESSIONID || '';
+const IG_CSRFTOKEN = (SESSION && SESSION.cookies && SESSION.cookies.csrftoken) || process.env.IG_CSRFTOKEN || '';
+const IG_DS_USER_ID = (SESSION && SESSION.cookies && SESSION.cookies.ds_user_id) || process.env.IG_DS_USER_ID || '';
+const HAS_SESSION = !!(SESSION || process.env.IG_SESSIONID);
+
+function sessionCookieHeader() {
+  if (SESSION && SESSION.cookies) {
+    return Object.entries(SESSION.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+  return `sessionid=${IG_SESSIONID}; ds_user_id=${IG_DS_USER_ID}; csrftoken=${IG_CSRFTOKEN}`;
+}
+function sessionUserAgent() {
+  if (SESSION && SESSION.user_agent) return SESSION.user_agent;
+  return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+}
 
 // Telegram for direct sending (set via Railway env vars)
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
@@ -97,6 +132,7 @@ app.get('/', (req, res) => res.json({
   status: 'ok',
   service: 'ig-carousel-fallback',
   dmMonitor: IG_SESSIONID ? 'enabled' : 'disabled',
+  session: HAS_SESSION ? (SESSION ? 'bundle' : 'env') : 'disabled',
   processedCount: processedMessageIds.size,
 }));
 
@@ -117,7 +153,7 @@ app.post('/fetch', async (req, res) => {
   try {
     // Try logged-in session first (better for age-gated / restricted posts)
     let items = [];
-    if (IG_SESSIONID) {
+    if (HAS_SESSION) {
       try {
         items = await fetchViaSession(url);
         console.log(`[fetch] session got ${items.length} items`);
@@ -142,16 +178,16 @@ app.post('/fetch', async (req, res) => {
 
 /**
  * Fetch media using logged-in Instagram session.
- * Uses direct HTTP (no browser) with session cookies - 5-10x faster than Puppeteer.
+ * Uses direct HTTP (no browser) with the full mobile session bundle
+ * (all cookies + mobile User-Agent) - 5-10x faster than Puppeteer.
  */
 async function fetchViaSession(url) {
   const https = require('https');
   return new Promise((resolve, reject) => {
-    const cookieStr = `sessionid=${IG_SESSIONID}; ds_user_id=${IG_DS_USER_ID}; csrftoken=${IG_CSRFTOKEN}`;
     const options = {
       headers: {
-        'Cookie': cookieStr,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Cookie': sessionCookieHeader(),
+        'User-Agent': sessionUserAgent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
       },
@@ -163,25 +199,78 @@ async function fetchViaSession(url) {
       res.on('data', chunk => html += chunk);
       res.on('end', () => {
         try {
-          const out = [];
-          const seen = new Set();
-          const videoRe = /"video_url"\s*:\s*"([^"]+)"/g;
-          let m;
-          while ((m = videoRe.exec(html)) !== null) {
-            let u = m[1].replace(/\u0026/g, '&').replace(/\\/g, '');
-            if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'video', url: u }); }
-          }
-          const imgRe = /"display_url"\s*:\s*"([^"]+)"/g;
-          while ((m = imgRe.exec(html)) !== null) {
-            let u = m[1].replace(/\u0026/g, '&').replace(/\\/g, '');
-            if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'photo', url: u }); }
-          }
+          // 1) carousel: ordered slides from edge_sidecar_to_children
+          let out = extractSidecarItems(html);
+          // 2) fallback: regex scan (single photo / video / reel)
+          if (!out || out.length === 0) out = extractMediaRegex(html);
           console.log(`[session] extracted ${out.length} items (direct HTTP)`);
           resolve(out);
         } catch (e) { reject(e); }
       });
     }).on('error', reject).on('timeout', () => reject(new Error('HTTP timeout')));
   });
+}
+
+/**
+ * Ordered carousel slides from the page's edge_sidecar_to_children JSON.
+ * Returns null when the post is not a carousel (caller falls back to regex).
+ */
+function extractSidecarItems(html) {
+  const ki = html.indexOf('"edge_sidecar_to_children"');
+  if (ki === -1) return null;
+  const ei = html.indexOf('"edges"', ki);
+  if (ei === -1) return null;
+  const bi = html.indexOf('[', ei);
+  if (bi === -1) return null;
+  // bracket-match the edges array, respecting quoted strings
+  let depth = 0, inStr = false, esc = false, end = -1;
+  for (let i = bi; i < html.length; i++) {
+    const c = html[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+    } else {
+      if (c === '"') inStr = true;
+      else if (c === '[') depth++;
+      else if (c === ']') { depth--; if (depth === 0) { end = i; break; } }
+    }
+  }
+  if (end === -1) return null;
+  let edges;
+  try { edges = JSON.parse(html.slice(bi, end + 1)); } catch (e) { return null; }
+  const out = [];
+  const seen = new Set();
+  for (const e of edges) {
+    const n = e && e.node;
+    if (!n) continue;
+    const isVideo = n.is_video === true || n.__typename === 'GraphVideo';
+    let u = (isVideo && n.video_url) || n.display_url || '';
+    u = String(u).replace(/\u0026/g, '&').replace(/\\/g, '');
+    if (u && u.includes('cdn') && !seen.has(u)) {
+      seen.add(u);
+      out.push({ type: isVideo ? 'video' : 'photo', url: u });
+    }
+  }
+  return out;
+}
+
+/** Regex scan for single-media posts (photo / video / reel). */
+function extractMediaRegex(html) {
+  const out = [];
+  const seen = new Set();
+  const videoRe = /"video_url"\s*:\s*"([^"]+)"/g;
+  let m;
+  while ((m = videoRe.exec(html)) !== null) {
+    let u = m[1].replace(/\u0026/g, '&').replace(/\\/g, '');
+    if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'video', url: u }); }
+  }
+  const imgRe = /"display_url"\s*:\s*"([^"]+)"/g;
+  while ((m = imgRe.exec(html)) !== null) {
+    let u = m[1].replace(/\u0026/g, '&').replace(/\\/g, '');
+    if (!seen.has(u) && u.includes('cdn')) { seen.add(u); out.push({ type: 'photo', url: u }); }
+  }
+  return out;
 }
 
 async function fetchViaSaveclip(url) {
