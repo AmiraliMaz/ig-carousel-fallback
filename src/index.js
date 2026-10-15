@@ -8,7 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 // Secret to prevent abuse — set via env on Railway
-const API_SECRET = process.env.API_SECRET || '';
+const API_SECRET = process.env.API_SECRET || 'carousel-fallback-2026';
 
 // Instagram session: full mobile bundle (instagrapi dump_settings) preferred.
 // Primary: SESSION_JSON env var (JSON string). Fallback: ./session.json file.
@@ -139,7 +139,7 @@ app.get('/', (req, res) => res.json({
 /**
  * POST /fetch
  * Body: { url: "https://www.instagram.com/p/XXXX/", secret: "..." }
- * Returns: { status: "ok", items: [{ type: "photo"|"video", url: "https://..." }, ...], source: "session"|"saveclip" }
+ * Returns: { status: "ok", items: [{ type: "photo"|"video", url: "https://..." }, ...], source: "anonymous"|"session"|"saveclip" }
  */
 app.post('/fetch', async (req, res) => {
   const { url, secret } = req.body || {};
@@ -151,19 +151,29 @@ app.post('/fetch', async (req, res) => {
   }
 
   try {
-    // Try logged-in session first (better for age-gated / restricted posts)
+    // 1. Anonymous embed route first: fast, no login, no ban risk.
+    //    Covers public reels / posts / carousels.
     let items = [];
     let source = 'none';
-    if (HAS_SESSION) {
+    try {
+      items = await fetchViaAnonymous(url);
+      source = 'anonymous';
+      console.log(`[fetch] anonymous got ${items.length} items`);
+    } catch (e) {
+      console.log(`[fetch] anonymous failed: ${e.message}`);
+    }
+    // 2. Logged-in session (for age-gated / restricted / private posts).
+    //    Fails fast when the session is logged out.
+    if (items.length === 0 && HAS_SESSION) {
       try {
         items = await fetchViaSession(url);
         source = 'session';
         console.log(`[fetch] session got ${items.length} items`);
       } catch (e) {
-        console.log(`[fetch] session failed: ${e.message}, falling back to saveclip`);
+        console.log(`[fetch] session failed: ${e.message}`);
       }
     }
-    // Fallback to saveclip
+    // 3. Saveclip last resort
     if (items.length === 0) {
       items = await fetchViaSaveclip(url);
       if (items.length > 0) source = 'saveclip';
@@ -178,6 +188,118 @@ app.post('/fetch', async (req, res) => {
   }
 });
 
+
+/**
+ * Fetch media anonymously via Instagram's public embed page
+ * (https://www.instagram.com/p/{shortcode}/embed/). No login, no browser,
+ * no session — just one HTTPS GET. The embed page is what Instagram serves
+ * for website embeds, so it's built for public access. Returns ordered
+ * items; carousels come back slide-by-slide with correct types.
+ * Ported from the n8n "Extract Video" node logic (proven in production).
+ */
+async function fetchViaAnonymous(url) {
+  const m = String(url || '').match(/instagram\.com\/(p|reel|tv)\/([A-Za-z0-9_-]+)/);
+  if (!m) throw new Error('no shortcode in url');
+  const embedUrl = `https://www.instagram.com/${m[1]}/${m[2]}/embed/`;
+  console.log('[anonymous] fetching', embedUrl);
+  const html = await httpsGetText(embedUrl, {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+  });
+  // Unescape multi-escaped JSON (same approach as n8n "Extract Video")
+  const decodeOnce = (s) => {
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '\\' && i + 1 < s.length) {
+        const n = s[i + 1];
+        if (n === 'u' && i + 5 < s.length) {
+          const hex = s.slice(i + 2, i + 6);
+          if (/^[0-9a-fA-F]{4}$/.test(hex)) { out += String.fromCharCode(parseInt(hex, 16)); i += 5; continue; }
+        }
+        if (n === 'n') { out += '\n'; i++; continue; }
+        if (n === 't') { out += '\t'; i++; continue; }
+        if (n === 'r') { out += '\r'; i++; continue; }
+        out += n; i++; continue;
+      }
+      out += c;
+    }
+    return out;
+  };
+  let t = html;
+  for (let r = 0; r < 4; r++) { const d = decodeOnce(t); if (d === t) break; t = d; }
+
+  const out = [];
+  const seen = new Set();
+  const push = (type, u) => {
+    if (u && !seen.has(u)) { seen.add(u); out.push({ type, url: u }); }
+  };
+
+  // Carousel: edge_sidecar_to_children with per-slide nodes
+  const carouselIdx = t.indexOf('edge_sidecar_to_children');
+  if (carouselIdx !== -1) {
+    const section = t.slice(carouselIdx, carouselIdx + 200000);
+    const nodePattern = /"node":\{"id":"(\d+)","shortcode":"([^"]+)","is_video":(true|false)/g;
+    const slides = [];
+    let nm;
+    while ((nm = nodePattern.exec(section)) !== null) {
+      slides.push({ shortcode: nm[2], isVideo: nm[3] === 'true' });
+    }
+    if (slides.length > 1) {
+      const videoUrls = [];
+      const vm = /"video_url":"(https?[^\"]*?\.mp4[^\"]*)"/g;
+      let vmm;
+      while ((vmm = vm.exec(section)) !== null) videoUrls.push(vmm[1]);
+      const photoUrls = [];
+      const pm = /"display_url":"(https?[^\"]+)"/g;
+      let pmm;
+      while ((pmm = pm.exec(section)) !== null) photoUrls.push(pmm[1]);
+      let vIdx = 0, pIdx = 0;
+      for (const s of slides) {
+        if (s.isVideo) { if (vIdx < videoUrls.length) push('video', videoUrls[vIdx]); vIdx++; }
+        else { if (pIdx < photoUrls.length) push('photo', photoUrls[pIdx]); pIdx++; }
+      }
+      console.log(`[anonymous] extracted ${out.length} carousel items`);
+      if (!out.length) throw new Error('carousel found but no slide urls');
+      return out;
+    }
+  }
+
+  // Single video post / reel
+  const svm = t.match(/"video_url"\s*:\s*"(https?[^\"]*?\.mp4[^\"]*)"/);
+  if (svm) {
+    push('video', svm[1]);
+  } else {
+    // Single photo post
+    const spm = t.match(/"display_url"\s*:\s*"(https?[^\"]+)"/);
+    if (spm) push('photo', spm[1]);
+  }
+  console.log(`[anonymous] extracted ${out.length} items`);
+  if (!out.length) throw new Error('no media urls in embed page');
+  return out;
+}
+
+function httpsGetText(url, headers) {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers, timeout: 20000 }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error('embed HTTP ' + res.statusCode + ' ' + body.slice(0, 80)));
+        resolve(body);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('embed timeout')); });
+  });
+}
 
 /**
  * Fetch media using the logged-in Instagram session via the private
